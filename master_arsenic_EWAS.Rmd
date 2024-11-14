@@ -1,0 +1,1511 @@
+# EWAS 
+
+# Interactive session/troubleshooting code
+```{bash}
+srun --ntasks=1 --ntasks-per-node=20 --mem=100G --time=120:00:00 --pty bash
+module load gcc
+module load plink/2.0
+module load miniconda3
+conda activate r_env
+```
+
+# Loading modules
+```{bash}
+module load gcc/12.1.0
+module load miniconda3/23.1.0
+conda activate r_env
+# export TMPDIR=/gpfs/data/phs/groups/Projects/GEMS/james.li/conda_env/tmp
+export TMPDIR=/scratch/jll1/tmp
+```
+
+# Processing baseline sample phenotype data
+```{bash}
+Rscript /gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/code/rscripts/PROCESSING_BASELINE_SAMPLE_PHENOTYPE_DATA.R
+```
+
+# Copying IDAT out of directories into a designated folder (do only the first time)
+```{bash}
+cd /gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/data/idat
+for filename in `ls -d /gpfs/data/phs/groups/Projects/GEMS/EPIC_array/EPIC_data_2021/IDAT_files/*/`
+do
+    cd ${filename}
+    cp *.idat /gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/data/champ_idat/
+done
+cd /gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/data/champ_idat
+```
+
+# Importing data into ChAMP via minfi, performing noob background correction + BMIQ normalization (no longer estimates cell type composition for samples)
+```{bash}
+sbatch /gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/code/sbatch/CHAMP_IMPORT.sh
+```
+
+# Combining methylation data and covariates from 2017 and 2021 batches
+```{bash}
+Rscript /gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/code/rscripts/COMBINE_DNAM_2017_2021.R
+```
+
+# Utilize EpiDISH to estimate cell type fractions prior to running EWAS adjusting for only cell type comp and no SVs
+```{bash}
+conda deactivate 
+conda activate test_empty
+export TMPDIR=/gpfs/data/phs/groups/Projects/GEMS/james.li/conda_env/tmp
+
+Rscript /gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/code/rscripts/EPIDISH_CELLTYPE_FRAC.R
+```
+
+# Preparing the manifest file to annotate the EWAS results (already run, don't need to run again)
+```{bash}
+# bash /gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/code/bashscripts/PARSE_MANIFEST_ANNOTATION_FILE.sh
+```
+
+# Obtaining covariate file that only includes inorganic and methylated arsenic species
+```{r}
+library(data.table)
+library(readxl)
+library(dplyr)
+library(ggplot2)
+
+# reading in existing covariates
+load("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/data/combined_cov.RData")
+
+# reading in arsenic species data
+UAs_species <- fread("/gpfs/data/phs/groups/Projects/HEALS datasets/Baseline Data/UrineData.csv",sep=",") 
+UAs_species <- UAs_species %>% rename(Sample_Name = subjectid) %>% mutate(Sample_Name = paste0("X",as.character(Sample_Name))) %>% replace(is.na(.), 0) %>% mutate(total_iAs_mAs = asiii+dma+mma+asv) %>% mutate(total_UAs = asc + asb + asb_c + asiii+dma+mma+asv) %>% filter(total_UAs > 0) %>% select(Sample_Name,urineas,total_UAs,total_iAs_mAs) %>% rename(Recorded = urineas, Sum=total_UAs)
+
+# joining existing covariates with As species data
+join_df <- inner_join(combined_cov,UAs_species,by=c("Sample_Name"))
+png("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/other/sum_ALL_vs_recorded.png",units="in",height=5,width=5,res=1200)
+ggplot(join_df,aes(x=Sum,y=Recorded)) + geom_point() + geom_abline(slope=1, intercept = 0) + xlab("Sum of all As species")
+dev.off()
+
+# joining existing covariates with As species data
+join_df <- inner_join(combined_cov,UAs_species,by=c("Sample_Name"))
+png("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/other/sums.png",units="in",height=5,width=5,res=1200)
+ggplot(join_df,aes(x=Sum,y=total_iAs_mAs)) + geom_point() + geom_abline(slope=1, intercept = 0) + xlab("Sum of all As species") + ylab("Sum of all methylated and inorganic As species")
+dev.off()
+
+# joining existing covariates with As species data
+png("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/other/sum_relevant_vs_recorded.png",units="in",height=5,width=5,res=1200)
+ggplot(join_df,aes(x=total_iAs_mAs,y=Recorded)) + geom_point() + geom_abline(slope=1, intercept = 0) + xlab("Sum of all methylated and inorganic As species")
+dev.off()
+```
+
+# Adding log2_sumInMetAsCr based on metabolite percentages
+```{r}
+library(sas7bdat)
+library(data.table)
+library(dplyr)
+library(ggplot2)
+
+# import metabolite concentrations
+x<-read.sas7bdat("/gpfs/data/phs/groups/Projects/HEALS datasets/Baseline Data/urineasmets_20120326.sas7bdat",debug=T)
+x <- x %>% mutate(sumInMetAs_BASELINE = (ASIII + AsV + MMA + DMA),Sample_Name=paste0("X",SubjectID)) %>% select(Sample_Name,sumInMetAs_BASELINE)
+# import urine creatinine data
+y<-read.sas7bdat("/gpfs/data/phs/groups/Projects/HEALS datasets/Baseline Data/urinedata.sas7bdat",debug=T) %>% mutate(Sample_Name=paste0("X",SubjectID)) %>% filter(Notes=="Baseline") %>% select(Sample_Name,UrineCreat)
+# calculating log2(sumInMetAsCr)
+xy <- inner_join(x,y,by=c("Sample_Name")) 
+xy <- xy %>% mutate(log2_sumInMetAsCr = log2(sumInMetAs_BASELINE / UrineCreat * 100)) %>% select(Sample_Name,log2_sumInMetAsCr)
+
+load("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/data/combined_cov.RData")
+combined_cov_w_sumInMetAsCr <- inner_join(combined_cov,xy,by=c("Sample_Name"))
+save(combined_cov_w_sumInMetAsCr,file="/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/data/combined_cov_w_sumInMetAsCr.RData")
+
+library(ggpubr)
+png("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output/scatterplot_UrAsgmCr_sumInMetAsCr.png",res=1200,units="in",height=6,width=6)
+ggplot(combined_cov_w_sumInMetAsCr,aes(y=log2_UrAsgmCr,x=log2_sumInMetAsCr)) + geom_point() + geom_smooth(method="lm") + theme_classic() + stat_cor(method="pearson", digits=3, aes(label = paste(..rr.label.., ..p.label.., sep = "~`,`~"))) + ylab("log2[Total urinary As]") + xlab("log2[Sum of inorganic and methylated As species]")
+dev.off()
+
+library(ggpubr)
+png("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output/scatterplot_UrAsgmCr_WArsenic.png",res=1200,units="in",height=6,width=6)
+ggplot(combined_cov,aes(y=log2_UrAsgmCr,x=log2_WArsenic)) + geom_point() + geom_smooth(method="lm") + theme_classic() + stat_cor(method="pearson", digits=3, aes(label = paste(..rr.label.., ..p.label.., sep = "~`,`~"))) + ylab("log2[Total urinary As]") + xlab("log2[As levels in well water]")
+dev.off()
+```
+
+
+# Running EWASs using sbatch
+```{bash}
+for i in log2_UrAsgmCr log2_WArsenic
+do
+    sbatch --export=ARGS1=${i} /gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/code/sbatch/RUN_EWAS_HEALS_COMBINED_svaSV_log2_UrAsgmCr_log2_WArsenic.sh
+done
+
+for i in log2_UrAsgmCr log2_WArsenic
+do
+    sbatch --export=ARGS1=${i} /gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/code/sbatch/RUN_EWAS_HEALS_COMBINED_onlySV_log2_UrAsgmCr_log2_WArsenic.sh
+done
+
+for i in log2_UrAsgmCr log2_WArsenic
+do
+    sbatch --export=ARGS1=${i} /gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/code/sbatch/RUN_EWAS_HEALS_COMBINED_celltype_noSV_log2_UrAsgmCr_log2_WArsenic.sh
+done
+
+##############################
+# skin lesion stuff
+sbatch /gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/code/EWAS_qsub/RUN_EWAS_HEALS_COMBINED_svaSV_anyskinlesion.sh
+sbatch /gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/code/EWAS_qsub/RUN_EWAS_HEALS_COMBINED_svaSV_anyskinlesion_noexp.sh
+```
+
+# assessing genomic inflation following incremental inclusion of SVs for log2_UrAsgmCr
+```{bash}
+for i in log2_UrAsgmCr log2_WArsenic
+do
+  sbatch --export=ARGS1=${i} /gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/code/sbatch/COMPUTE_SV_INFLATION_FACTORS.sh
+done
+
+######################################################################
+# assessing inflation factors based on different approaches
+R
+setwd("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output")
+
+exposures <- c("log2_UrAsgmCr","log2_WArsenic")
+model_type_vec <- c("celltype_noSV","onlySV","svaSV")
+
+inflation_mat <- matrix(nrow = 3, ncol = length(exposures))
+colnames(inflation_mat) <- c("log2(UrAsgmCr)","log2(WArsenic)")
+rownames(inflation_mat) <- c("Cell Type Composition without SVs","Only SVs without other covariates", "Covariates + default # of SVs obtained from the sva package")
+for (i in 1:length(exposures)) {
+  for (j in 1:length(model_type_vec)) {
+
+    exposure <- exposures[i]
+    model_type <- model_type_vec[j]
+    load(paste0("results_EWAS_HEALS_combined_mval_",model_type,"_",exposure,".RData"))
+    print(paste0(model_type,exposure))
+
+    pvalue <- results$P.Value
+    chisq <- qchisq(1 - pvalue, 1)
+    lambda <- median(chisq) / qchisq(0.5, 1)
+
+    inflation_mat[j,i] <- lambda
+    print(lambda)
+  }
+}
+write.table(inflation_mat,file="inflation_mat.csv",sep=",",quote=F)
+```
+
+# Examining correlation between SVs and Cell Type Composition
+```{bash}
+library(data.table)
+library(dplyr)
+library(ggplot2)
+
+setwd("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/data")
+
+exposure_var_list <- c("log2_UrAsgmCr","log2_WArsenic")
+for (exposure_var in exposure_var_list) {
+  load("CT_frac.RData")
+  CT_frac$Eosino <- NULL
+  load(paste0("sv_EWAS_HEALS_combined_svaSV_",exposure_var,".RData"))
+  sv_table <- data.frame(sv)
+  sv_table$Sample_Name <- row.names(sv_table)
+
+  joined_table <- inner_join(CT_frac,sv_table,by=c("Sample_Name"))
+
+  # identifying column index of the first SV
+  first_SV_index <- head(which(grepl("SV",colnames(joined_table))),1)
+
+  # make correlation matrix 
+  cor_mat <- matrix(nrow = 6, ncol = length(first_SV_index:ncol(joined_table)))
+  for (i in c(1:6)) {
+      for (j in c(first_SV_index:ncol(joined_table))) {
+          cor_mat[i,(j-first_SV_index + 1)] <- cor.test(joined_table[,i], joined_table[,j],  method = "pearson")$p.value
+      }
+  }
+
+  # outputting the data table of correlations
+  cor_df <- data.frame(cor_mat)
+  rownames(cor_df) <- colnames(joined_table)[1:6]
+  colnames(cor_df) <- colnames(joined_table)[first_SV_index:ncol(joined_table)]
+
+  write.table(cor_df,file=paste0("CT_SV_correlations_",exposure_var,".csv"),sep=",",quote=F)
+}
+```
+
+
+# Examining correlations between cell type composition and arsenic exposure
+```{bash}
+library(data.table)
+library(dplyr)
+library(ggplot2)
+
+setwd("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/data")
+
+# make correlation matrix 
+CT_Ars_cor_mat <- matrix(nrow = 6, ncol = 4)
+rownames(CT_Ars_cor_mat) <- c("B","NK","CD4T","CD8T","Mono","Neutro")
+colnames(CT_Ars_cor_mat) <- c("log2_UrAsgmCr Effect Size","log2_UrAsgmCr p-value","log2_WArsenic Effect Size","log2_WArsenic p-value")
+load("CT_frac.RData")
+CT_frac$Eosino <- NULL
+load("combined_cov.RData")
+combined_cov <- combined_cov %>% select(Sample_Name,Age,Sex,log2_UrAsgmCr,log2_WArsenic)
+joined_table <- inner_join(combined_cov,CT_frac,by=c("Sample_Name"))
+
+# log2_UrAsgmCr effect size
+CT_Ars_cor_mat[1,1] <- summary(lm(data = joined_table, log2_UrAsgmCr ~ B + Age + as.factor(Sex)))$coefficients[2,1]
+CT_Ars_cor_mat[2,1] <- summary(lm(data = joined_table, log2_UrAsgmCr ~ NK + Age + as.factor(Sex)))$coefficients[2,1]
+CT_Ars_cor_mat[3,1] <- summary(lm(data = joined_table, log2_UrAsgmCr ~ CD4T + Age + as.factor(Sex)))$coefficients[2,1]
+CT_Ars_cor_mat[4,1] <- summary(lm(data = joined_table, log2_UrAsgmCr ~ CD8T + Age + as.factor(Sex)))$coefficients[2,1]
+CT_Ars_cor_mat[5,1] <- summary(lm(data = joined_table, log2_UrAsgmCr ~ Mono + Age + as.factor(Sex)))$coefficients[2,1]
+CT_Ars_cor_mat[6,1] <- summary(lm(data = joined_table, log2_UrAsgmCr ~ Neutro + Age + as.factor(Sex)))$coefficients[2,1]
+
+# log2_UrAsgmCr p-values
+CT_Ars_cor_mat[1,2] <- summary(lm(data = joined_table, log2_UrAsgmCr ~ B + Age + as.factor(Sex)))$coefficients[2,4]
+CT_Ars_cor_mat[2,2] <- summary(lm(data = joined_table, log2_UrAsgmCr ~ NK + Age + as.factor(Sex)))$coefficients[2,4]
+CT_Ars_cor_mat[3,2] <- summary(lm(data = joined_table, log2_UrAsgmCr ~ CD4T + Age + as.factor(Sex)))$coefficients[2,4]
+CT_Ars_cor_mat[4,2] <- summary(lm(data = joined_table, log2_UrAsgmCr ~ CD8T + Age + as.factor(Sex)))$coefficients[2,4]
+CT_Ars_cor_mat[5,2] <- summary(lm(data = joined_table, log2_UrAsgmCr ~ Mono + Age + as.factor(Sex)))$coefficients[2,4]
+CT_Ars_cor_mat[6,2] <- summary(lm(data = joined_table, log2_UrAsgmCr ~ Neutro + Age + as.factor(Sex)))$coefficients[2,4]
+
+# log2_WArsenic effect size
+CT_Ars_cor_mat[1,3] <- summary(lm(data = joined_table, log2_WArsenic ~ B + Age + as.factor(Sex)))$coefficients[2,1]
+CT_Ars_cor_mat[2,3] <- summary(lm(data = joined_table, log2_WArsenic ~ NK + Age + as.factor(Sex)))$coefficients[2,1]
+CT_Ars_cor_mat[3,3] <- summary(lm(data = joined_table, log2_WArsenic ~ CD4T + Age + as.factor(Sex)))$coefficients[2,1]
+CT_Ars_cor_mat[4,3] <- summary(lm(data = joined_table, log2_WArsenic ~ CD8T + Age + as.factor(Sex)))$coefficients[2,1]
+CT_Ars_cor_mat[5,3] <- summary(lm(data = joined_table, log2_WArsenic ~ Mono + Age + as.factor(Sex)))$coefficients[2,1]
+CT_Ars_cor_mat[6,3] <- summary(lm(data = joined_table, log2_WArsenic ~ Neutro + Age + as.factor(Sex)))$coefficients[2,1]
+
+# log2_WArsenic p-values
+CT_Ars_cor_mat[1,4] <- summary(lm(data = joined_table, log2_WArsenic ~ B + Age + as.factor(Sex)))$coefficients[2,4]
+CT_Ars_cor_mat[2,4] <- summary(lm(data = joined_table, log2_WArsenic ~ NK + Age + as.factor(Sex)))$coefficients[2,4]
+CT_Ars_cor_mat[3,4] <- summary(lm(data = joined_table, log2_WArsenic ~ CD4T + Age + as.factor(Sex)))$coefficients[2,4]
+CT_Ars_cor_mat[4,4] <- summary(lm(data = joined_table, log2_WArsenic ~ CD8T + Age + as.factor(Sex)))$coefficients[2,4]
+CT_Ars_cor_mat[5,4] <- summary(lm(data = joined_table, log2_WArsenic ~ Mono + Age + as.factor(Sex)))$coefficients[2,4]
+CT_Ars_cor_mat[6,4] <- summary(lm(data = joined_table, log2_WArsenic ~ Neutro + Age + as.factor(Sex)))$coefficients[2,4]
+
+# outputting the data table of correlations p-values 
+CT_Ars_cor_df <- data.frame(CT_Ars_cor_mat)
+write.table(CT_Ars_cor_df,file=paste0("CT_Ars_correlations.csv"),sep=",",quote=F)
+
+```
+
+# Running EWAS with an appropriate number of SVs based on the inflation plot 
+```{bash}
+# running EWASs with pooled methylation data from 2017 and 2021 with a specified number of SVs to use
+o=log2_UrAsgmCr
+p=9
+sbatch --export=ALL,ARGS1=${o},ARGS2=${p} /gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/code/sbatch/RUN_EWAS_HEALS_COMBINED_specifySV_log2_UrAsgmCr_log2_WArsenic.sh 
+
+o=log2_WArsenic
+p=9
+sbatch --export=ALL,ARGS1=${o},ARGS2=${p} /gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/code/sbatch/RUN_EWAS_HEALS_COMBINED_specifySV_log2_UrAsgmCr_log2_WArsenic.sh 
+```
+
+# Comparing total log2_UrAsgmCr vs. log2_sum_InMethAs EWASs
+```{r}
+library(data.table)
+library(dplyr)
+
+setwd("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output/")
+load("results_final_EWAS_HEALS_combined_mval_specifySV_log2_UrAsgmCr_9SV.RData")
+results_final_1 <- results_final
+
+load("results_final_EWAS_HEALS_combined_mval_specifySV_log2_sumInMetAsCr_9SV.RData")
+results_final_2 <- results_final
+
+
+sig_1 <- (results_final_1 %>% filter(adj.P.Val<0.05))$Name
+sig_2 <- (results_final_2 %>% filter(adj.P.Val<0.05))$Name 
+length(unique(intersect(
+  sig_1,
+  sig_2
+)))
+
+sig_df_1 <- results_final_1 %>% filter(adj.P.Val<0.05) %>% select(Name,logFC)
+
+join_logfc_df <- inner_join(sig_df_1, results_final_2 %>% select(Name,logFC), by=c("Name"))
+
+library(ggplot2)
+library(ggpubr)
+png("scatterplot_effect_totAsCr_sumInMethAsCr.png",res=1200,units="in",height=6,width=6)
+ggplot(join_logfc_df, aes(x=logFC.x,y=logFC.y)) + geom_point() + xlab("Effect sizes from primary EWAS of total urinary As") + ylab("Effect sizes from EWAS of sum of inorganic and methylated As") + geom_smooth(method="lm") + theme_classic() + stat_cor(method="pearson", digits=3, aes(label = paste(..rr.label.., ..p.label.., sep = "~`,`~")))
+dev.off()
+```
+
+# Overlap of EWAS CpGs between 43 and 116 SVs for log2_UrAsgmCr
+```{bash}
+library(ggvenn)
+library(data.table)
+library(dplyr)
+library("gridExtra")
+library(ggplot2)
+
+setwd("P:/GEMS/james.li/EWAS/output")
+load("results_final_EWAS_HEALS_combined_mval_svaSV_log2_UrAsgmCr.RData")
+dim(results_final)
+sv116<-c((results_final%>%filter(P.Value < 0.05/nrow(results_final)))$Name)
+
+load("results_final_EWAS_HEALS_combined_mval_specifySV_log2_UrAsgmCr_43SV.RData")
+sv43<-c((results_final%>%filter(P.Value < 0.05/nrow(results_final)))$Name)
+
+A <-list('116 SVs'=c(sv116),'43 SVs'=c(sv43))
+venn_output<-ggvenn(A)
+venn_output<-venn_output+ggtitle(paste0("Overlap of differentially methylated CpGs (Bonferroni) \nbetween EWASs run with 43 vs. 116 SVs")) + theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5))
+pdf(paste0("43_vs_116SV_CpG_overlap_BONFERRONI.pdf"),width=12)
+print(venn_output)
+dev.off()
+
+load("results_final_EWAS_HEALS_combined_mval_svaSV_log2_UrAsgmCr.RData")
+dim(results_final)
+sv116<-c((results_final%>%filter(adj.P.Val < 0.05))$Name)
+
+load("results_final_EWAS_HEALS_combined_mval_specifySV_log2_UrAsgmCr_43SV.RData")
+sv43<-c((results_final%>%filter(adj.P.Val < 0.05))$Name)
+
+A <-list('116 SVs'=c(sv116),'43 SVs'=c(sv43))
+venn_output<-ggvenn(A)
+venn_output<-venn_output+ggtitle(paste0("Overlap of differentially methylated CpGs (FDR) \nbetween EWASs run with 43 vs. 116 SVs")) + theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5))
+pdf(paste0("43_vs_116SV_CpG_overlap_FDR.pdf"),width=12)
+print(venn_output)
+dev.off()
+```
+
+# Assessing inflation factors of different model approaches
+```{bash}
+R
+setwd("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output")
+
+exposures <- c("log2_UrAsgmCr","log2_WArsenic")
+model_type_vec <- c("celltype_noSV","onlySV","svaSV")
+
+inflation_mat <- matrix(nrow = 4, ncol = length(exposures))
+colnames(inflation_mat) <- c("log2(UrAsgmCr)","log2(WArsenic)")
+rownames(inflation_mat) <- c("Cell Type Composition without SVs","Only SVs without other covariates", "Covariates + default # of SVs obtained from the sva package","Specified # of SVs")
+for (i in 1:length(exposures)) {
+  for (j in 1:length(model_type_vec)) {
+
+    exposure <- exposures[i]
+    model_type <- model_type_vec[j]
+    load(paste0("results_EWAS_HEALS_combined_mval_",model_type,"_",exposure,".RData"))
+    print(paste0(model_type,exposure))
+
+    pvalue <- results$P.Value
+    chisq <- qchisq(1 - pvalue, 1)
+    lambda <- median(chisq) / qchisq(0.5, 1)
+
+    inflation_mat[j,i] <- lambda
+    print(lambda)
+  }
+}
+
+# EWAS results for specified number of SVs
+for (i in 1:length(exposures)) {
+  exposure <- exposures[i]
+  load(paste0("results_EWAS_HEALS_combined_mval_specifySV_",exposure,"_9SV.RData"))
+  pvalue <- results$P.Value
+  chisq <- qchisq(1 - pvalue, 1)
+  lambda <- median(chisq) / qchisq(0.5, 1)
+  inflation_mat[4,i] <- lambda
+  print(lambda)
+}
+
+write.table(inflation_mat,file="inflation_mat.csv",sep=",",quote=F)
+```
+
+# Creating qqplot of our EWAS results for log2_UrAsgmCr and log2_WArsenic using 9 SVs
+```{r}
+library(gap)
+
+setwd("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output/")
+exposures <- c("log2_UrAsgmCr","log2_WArsenic")
+
+for (exposure in exposures) {
+  load(paste0("results_final_EWAS_HEALS_combined_mval_specifySV_",exposure,"_9SV.RData"))
+  my.pvalues<-results_final$P.Value
+  png(paste0("qqplot_",exposure,".png"),units="in",res=1200,height=5,width=5)
+  qqunif(my.pvalues,lcol="red",ci=F)
+  dev.off()
+}
+```
+
+# Plotting Manhattan Plots
+```{r}
+Rscript /gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/code/rscripts/MANHATTAN_log2_UrAsgmCr.R
+Rscript /gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/code/rscripts/MANHATTAN_log2_WArsenic.R
+```
+
+# Plotting regional plots
+```{r}
+Rscript /gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/code/rscripts/REGIONAL_PLOTS.R
+```
+
+# Examining consistency between urinary and water As
+```{r}
+library(ggplot2)
+library(dplyr)
+load("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output/results_final_EWAS_HEALS_combined_mval_specifySV_log2_UrAsgmCr_9SV.RData")
+log2_UrAsgmCr <- results_final
+load("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output/results_final_EWAS_HEALS_combined_mval_specifySV_log2_WArsenic_9SV.RData")
+WArsenic <- results_final
+log2_UrAsgmCr <- log2_UrAsgmCr %>% filter(adj.P.Val < 0.05) %>% select(Name,logFC)
+WArsenic <- WArsenic %>% select(Name,logFC)
+joined_logFC <- inner_join(log2_UrAsgmCr,WArsenic,by=c("Name"))
+colnames(joined_logFC) <- c("Name","Effect sizes in EWAS of urinary arsenic","Effect sizes in EWAS of water arsenic")
+
+# making a label to identify WArsenic hits in plot 
+sig_sensitivity_hits <- (results_final %>% filter(adj.P.Val < 0.05))$Name
+joined_logFC <- joined_logFC %>% mutate(identified=ifelse(Name %in% sig_sensitivity_hits,1,0))
+
+# plotting code to get automated r2 and p-value
+library(ggplot2)
+library(ggpubr)
+png("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output/URINE_WATER_AS_CONSISTENCY.png",res=1200,units="in",height=6,width=6)
+ggplot(joined_logFC, aes(x=`Effect sizes in EWAS of urinary arsenic`,y=`Effect sizes in EWAS of water arsenic`)) + xlab("Effect sizes from primary EWAS of total urinary As") + ylab("Effect sizes from EWAS of As in well water") +
+ geom_point() + geom_smooth(method="lm") + theme_classic() + stat_cor(method="pearson", digits=3, aes(label = paste(..rr.label.., ..p.label.., sep = "~`,`~")))
+dev.off()
+
+# geom_point(alpha=0.5,colour = "orange", data = ~subset(., identified == 1)) + 
+#  geom_point(alpha=0.5,colour = "black", data = ~subset(., identified == 0)) 
+
+
+```
+
+
+# Plotting enrichment of CpG islands plot 
+```{r}
+setwd("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output")
+library(ggplot2)
+exposure_var = "log2_UrAsgmCr"
+load(paste0("results_final_EWAS_HEALS_combined_mval_specifySV_",exposure_var,"_9SV.RData"))
+# parsing results file
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island==""]<-"Non-CpG Island"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="Island"]<-"Island"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="N_Shelf"]<-"Shelf"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="S_Shelf"]<-"Shelf"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="N_Shore"]<-"Shore"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="S_Shore"]<-"Shore"
+results_final$`Relation to UCSC CpG Island` <- results_final$Relation_to_UCSC_CpG_Island
+# generating the ggplot object for the volcano plot
+p<-ggplot(data=results_final,aes(y=-log10(P.Value),x=logFC,fill=`Relation to UCSC CpG Island`,colour=`Relation to UCSC CpG Island`)) + geom_point(alpha=0.7) + ylab("-log10(p-value)") + xlab("Log-fold Change") + theme_classic() + geom_hline(yintercept = -log10(0.05/nrow(results_final)),color="black") + theme(panel.border = element_rect(colour = "black", fill=NA),legend.position = "bottom", legend.title.position = "bottom", legend.title.align=0.5)
+# plotting volcano plot
+png(paste0("VOLCANO_PLOT_logFC_vs_pval_",exposure_var,".png"),units="in",height=5,width=4,res=1200)
+print(p)
+dev.off()
+```
+
+# Comparing distribution of relation to UCSC CpG Island for significant hits vs. rest of the CpGs
+```{r}
+library(dplyr)
+library(ggplot2)
+library(ggplot2)
+setwd("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output")
+exposure_var = "log2_UrAsgmCr"
+load(paste0("results_final_EWAS_HEALS_combined_mval_specifySV_",exposure_var,"_9SV.RData"))
+
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island==""]<-"Open Sea"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="Island"]<-"Island"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="N_Shelf"]<-"Shelf"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="S_Shelf"]<-"Shelf"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="N_Shore"]<-"Shore"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="S_Shore"]<-"Shore"
+
+###################################
+# Bonferroni-significant CpGs
+results_final_Bonferroni_significant<-results_final%>%filter(P.Value<0.05/nrow(results_final))
+results_final_NOT_Bonferroni_significant<-results_final%>%filter(P.Value>=0.05/nrow(results_final))
+not_significant_CpGs<-as.numeric(table(results_final_NOT_Bonferroni_significant$Relation_to_UCSC_CpG_Island))
+significant_CpGs<-as.numeric(table(results_final_Bonferroni_significant$Relation_to_UCSC_CpG_Island))
+island_df<-data.frame(significant_CpGs,not_significant_CpGs)
+rownames(island_df)<-names(table(results_final_NOT_Bonferroni_significant$Relation_to_UCSC_CpG_Island))
+island_df
+chisq.test(island_df)
+# determining number of cpgs by significance status
+NUM_SIG_CPG <- formatC(nrow(results_final_Bonferroni_significant), format="d", big.mark=",")
+NUM_NOSIG_CPG <- formatC(nrow(results_final_NOT_Bonferroni_significant), format="d", big.mark=",")
+# making stacked proportion barplots
+df_sig<-data.frame(table(results_final_Bonferroni_significant$Relation_to_UCSC_CpG_Island))
+df_sig$cpg_significance<-paste0("Bonferroni-significant CpGs\n(n=",NUM_SIG_CPG,")")
+df_sig$pct<-df_sig$Freq/sum(df_sig$Freq)*100
+df_not_sig<-data.frame(table(results_final_NOT_Bonferroni_significant$Relation_to_UCSC_CpG_Island))
+df_not_sig$cpg_significance<-paste0("Not Bonferroni-significant CpGs\n(n=",NUM_NOSIG_CPG,")")
+df_not_sig$pct<-df_not_sig$Freq/sum(df_not_sig$Freq)*100
+df_sig_notsig_combined<-rbind(df_sig,df_not_sig)
+colnames(df_sig_notsig_combined)[1]<-"Relation to UCSC CpG Island"
+# outputting plot
+png(paste0("RELATION_CPG_ISLAND_Bonferroni_",exposure_var,".png"),units="in",width=6,height=5,res=1500)
+ggplot(data=df_sig_notsig_combined) + aes(cpg_significance, pct, fill=`Relation to UCSC CpG Island`) +
+  geom_bar(stat="identity") +
+  ylab("Proportion of CpGs") +
+  xlab("Bonferroni-significance Status of CpGs") +
+  geom_text(aes(label=paste0(sprintf("%2.2f", pct),"%")),
+            position=position_stack(vjust=0.5)) +
+  #ggtitle("Relation to UCSC CpG Island for Bonferroni-significant CpGs\n(Bonferroni-adjusted p-value < 0.05)") +
+  theme_classic() + theme(text = element_text(size = 20),panel.border = element_rect(colour = "black", fill=NA))#,legend.position = "bottom", legend.title.position = "bottom", legend.title.align=0.5)     
+dev.off()
+
+###################################
+# FDR-significant CpGs
+results_final_FDR_significant<-results_final%>%filter(adj.P.Val<0.05)
+results_final_NOT_FDR_significant<-results_final%>%filter(adj.P.Val>=0.05)
+not_significant_CpGs<-as.numeric(table(results_final_NOT_FDR_significant$Relation_to_UCSC_CpG_Island))
+significant_CpGs<-as.numeric(table(results_final_FDR_significant$Relation_to_UCSC_CpG_Island))
+island_df<-data.frame(significant_CpGs,not_significant_CpGs)
+rownames(island_df)<-names(table(results_final_NOT_FDR_significant$Relation_to_UCSC_CpG_Island))
+island_df
+chisq.test(island_df)
+# determining number of cpgs by significance status
+NUM_SIG_CPG <- formatC(nrow(results_final_FDR_significant), format="d", big.mark=",")
+NUM_NOSIG_CPG <- formatC(nrow(results_final_NOT_FDR_significant), format="d", big.mark=",")
+# making stacked proportion barplots
+df_sig<-data.frame(table(results_final_FDR_significant$Relation_to_UCSC_CpG_Island))
+df_sig$cpg_significance<-paste0("FDR-significant \nCpGs\n(n=",NUM_SIG_CPG,")")
+df_sig$pct<-df_sig$Freq/sum(df_sig$Freq)*100
+df_not_sig<-data.frame(table(results_final_NOT_FDR_significant$Relation_to_UCSC_CpG_Island))
+df_not_sig$cpg_significance<-paste0("Not FDR-significant\n CpGs\n(n=",NUM_NOSIG_CPG,")")
+df_not_sig$pct<-df_not_sig$Freq/sum(df_not_sig$Freq)*100
+df_sig_notsig_combined<-rbind(df_sig,df_not_sig)
+colnames(df_sig_notsig_combined)[1]<-"Relation to UCSC CpG Island"
+# outputting plot
+png(paste0("RELATION_CPG_ISLAND_FDR_",exposure_var,".png"),units="in",width=3.5,height=4,res=1500)
+ggplot(data=df_sig_notsig_combined) + aes(cpg_significance, pct, fill=`Relation to UCSC CpG Island`) +
+  geom_bar(stat="identity") +
+  ylab("Proportion of CpGs") +
+  xlab(element_blank()) +
+  geom_text(aes(label=paste0(sprintf("%2.2f", pct),"%")),
+            position=position_stack(vjust=0.5)) +
+  #ggtitle("Relation to UCSC CpG Island for FDR-significant CpGs\n(FDR-adjusted p-value < 0.05)") +
+  theme_classic() + theme(text = element_text(size = 10),panel.border = element_rect(colour = "black", fill=NA),legend.title=element_blank(),legend.position = "bottom", legend.title.align=0.5)
+dev.off()
+```
+
+# Enrichment of chromatin segmentation annotations
+```{bash}
+for i in E062 E034 E045 E044 E043 E039 E040 E037 E048 E038 E047 E029 E035 E032 E046 E030
+do
+    sbatch --export=ARGS1=${i} /gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/code/sbatch/ENRICHMENT_CHROMATIN_SEGMENTATION.sh
+done
+
+# plotting all of them 
+library(data.table)
+library(tidyr)
+library(dplyr)
+library(tidyverse)
+library(sva)
+library(mgcv)
+library(nlme)
+library(genefilter)
+library(BiocParallel)
+library(ggplot2)
+library(scales)
+
+for (pval_threshold_method in (c("bonferroni","fdr"))) {
+  
+setwd(paste0("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output/",pval_threshold_method,"_chromatin_enrichment"))
+
+# initializing data frame to store everything 
+combined_chromatin_df <- data.frame(
+  chromatin_segmentation_type=as.character(),
+  logOR=as.numeric(),
+  pval=as.numeric(),
+  stars=as.character(),
+  type=as.character()
+)
+# storing all of our enrichment results
+for (i in c("E062", "E034", "E045", "E044", "E043", "E039", "E040", "E037", "E048", "E038", "E047", "E029", "E035", "E032", "E046", "E030")) {
+  load(paste0("chromatin_logOR_pval_",i,".RData"))
+  chromatin_logOR_pval$type <- rep(i,nrow(chromatin_logOR_pval))
+  combined_chromatin_df <- rbind(combined_chromatin_df,chromatin_logOR_pval)
+}
+
+# renaming the chromatin segmentation types to remove number label 
+combined_chromatin_df <- combined_chromatin_df %>% separate(chromatin_segmentation_type, sep="_", into = c("number", "chromatin_segmentation_type"),remove=TRUE)
+
+# converting logORs to ORs
+combined_chromatin_df <- combined_chromatin_df %>% mutate(OR = exp(logOR))
+
+# dictionary of chromatin annotations
+dict_type_index <- c("E062", "E034", "E045", "E044", "E043", "E039", "E040", "E037", "E048", "E038", "E047", "E029", "E035", "E032", "E046", "E030")
+dict_Type <- c("Primary mononuclear cells", "Primary T cells", "Primary T cells effector/memory enriched", "Primary T regulatory cells", "Primary T helper cells", "Primary T helper naive cells", "Primary T helper memory cells", "Primary T helper memory cells", "Primary T CD8+ memory cells", "Primary T helper naive cells", "Primary T CD8+ naive cells", "Primary monocytes", "Primary haematopoietic stem cells (HSCs)", "Primary B cells", "Primary natural killer cells", "Primary neutrophils")
+chromatin_dictionary <- data.frame(dict_type_index,dict_Type)
+colnames(chromatin_dictionary) <- c("type","Type")
+combined_chromatin_df <- inner_join(combined_chromatin_df,chromatin_dictionary,by=c("type"))
+
+# ggplot necessary vectors
+values <- c(0, 1, max(combined_chromatin_df$OR))
+breaks <- c(0, 1, max(combined_chromatin_df$OR))
+labels <- as.character(c(0, 1, round(max(combined_chromatin_df$OR),digits=2)))
+limits <- c(0,max(combined_chromatin_df$OR))
+level_order = c("TssA","TssAFlnk", "TxFlnk","Tx", "TxWk",  "EnhG", "Enh", "ZNF/Rpts", "Het", "TssBiv", "BivFlnk",  "EnhBiv", "ReprPC",  "ReprPCWk", "Quies")
+
+# plotting the enrichment of each chromatin segmentation annotation for ALL cell types
+g1 <- ggplot(combined_chromatin_df, aes(x = Type, factor(chromatin_segmentation_type, levels=level_order))) +
+    geom_tile(aes(fill = OR))+
+    geom_text(aes(label=stars), color="black", size=4)+
+    theme_bw()+coord_equal()+
+    scale_fill_gradientn(colours=c("orangered2","lightsalmon","white","lightblue2","lightblue3"),
+                         values=rescale(values), 
+                         guide="colorbar",
+                         labels = labels,
+                         limits = limits, 
+                         breaks=breaks)+xlab("Cell type")+ylab("Chromatin segmentation")+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))+labs(fill = "OR") #+ coord_flip() #+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+png(paste0("../CHMM_ENRICHMENT_ALL_",toupper(pval_threshold_method),".png"),units="in",height=8,width=10,res=1200)
+print(g1)
+dev.off()
+
+# plotting the enrichment of each chromatin segmentation annotation for cell types that can BE DECONVOLUTED IN OUR DATA
+combined_chromatin_df <- combined_chromatin_df %>% filter(Type %in% c("Primary B cells","Primary T helper naive cells","Primary T CD8+ naive cells","Primary monocytes","Primary natural killer cells","Primary neutrophils"))
+combined_chromatin_df$Type[combined_chromatin_df$Type=="Primary B cells"] <- "B Cells"
+combined_chromatin_df$Type[combined_chromatin_df$Type=="Primary T helper naive cells"] <- "CD4+ T Cells"
+combined_chromatin_df$Type[combined_chromatin_df$Type=="Primary T CD8+ naive cells"] <- "CD8+ T Cells"
+combined_chromatin_df$Type[combined_chromatin_df$Type=="Primary monocytes"] <- "Monocytes"
+combined_chromatin_df$Type[combined_chromatin_df$Type=="Primary natural killer cells"] <- "NK Cells"
+combined_chromatin_df$Type[combined_chromatin_df$Type=="Primary neutrophils"] <- "Neutrophils"
+
+# plotting the enrichment of each chromatin segmentation annotation for focused cell types
+g1 <- ggplot(combined_chromatin_df, aes(x = Type, factor(chromatin_segmentation_type, levels=level_order))) +
+    geom_tile(aes(fill = OR))+
+    geom_text(aes(label=stars), color="black", size=4)+
+    theme_bw()+coord_equal()+
+    scale_fill_gradientn(colours=c("orangered2","lightsalmon","white","lightblue2","lightblue3"),
+                         values=rescale(values), 
+                         guide="colorbar",
+                         labels = labels,
+                         limits = limits, 
+                         breaks=breaks)+xlab("Cell type")+ylab("Chromatin segmentation")+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),
+  legend.position = "bottom", legend.title.position = "bottom",legend.title.align=0.5, legend.key.size = unit(0.15, "in")  )+labs(fill = "OR") + coord_flip() #+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+png(paste0("../CHMM_ENRICHMENT_FOCUS_",toupper(pval_threshold_method),".png"),units="in",height=4.75,width=8,res=1200)
+print(g1)
+dev.off()
+}
+```
+
+# GO and KEGG pathway analysis (GSEA)
+```{bash}
+Rscript /gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/code/rscripts/GENE_SET_ENRICHMENT_ANALYSIS.R 
+
+# loading packages
+library(missMethyl)
+library(data.table)
+library(dplyr)
+
+# plotting venn diagram of HALLMARK GSEA results
+cpg_GS_list <- vector(length=2,mode="list")
+suffix_vec <- c("01","11")
+for (i in 1:length(suffix_vec)) {
+  tmp_gs_df <- fread(paste0("/gpfs/data/phs/groups/Projects/GTEx/james_li/smoking_ewas/GSEA_HALLMARK_FDR_",suffix_vec[i],".tsv"),header=T)
+  cpg_GS_list[[i]] <- (tmp_gs_df %>% filter(FDR<0.05))$Description
+}
+png("/gpfs/data/phs/groups/Projects/GTEx/james_li/smoking_ewas/GSEA_HALLMARK_FDR.png",width = 1000, height = 1000, units = "px", pointsize = 25)
+print(venn(cpg_GS_list,ilab=TRUE, zcolor = "style",snames=c("Ever vs. Never Smoker","Current vs. Never Smoker")))
+dev.off()
+
+
+all_gs<- c(as.vector(cpg_GS_list[1]),
+           as.vector(cpg_GS_list[2])
+)
+all_gs <- unlist(cpg_GS_list)
+data.table(table(all_gs) %>% sort(decreasing = T)) %>% filter(N>=2)
+```
+
+# Mendelian Randomization: MR with pooled 2017 and 2021 methylation data
+```{bash}
+for p_thresh_type in bonferroni #fdr  
+do
+  Rscript /gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/code/rscripts/MENDELIAN_RANDOMIZATION_SEQUENTIAL_REGRESSION_WITH_DMA.R ${p_thresh_type}
+done
+```
+
+# Generating epigenetic marker for EPIC array
+```{bash}
+Rscript /gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/code/rscripts/FINAL_EPIGENETIC_MARKER_EXPOSURE_ARSENIC_GLMNET.R
+```
+
+# Generating a separate epigenetic marker for the 450k array
+```{bash}
+Rscript /gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/code/rscripts/FINAL_EPIGENETIC_MARKER_EXPOSURE_ARSENIC_GLMNET_450K.R
+```
+
+# Validation of 450k marker in BEST
+```{r}
+library(data.table)
+library(tidyverse)
+setwd("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output/EPIGENETIC_MARKER_ARSENIC_EXPOSURE_450k")
+
+# loading output model coefficients
+file_name <- "EPIGENETIC_MARKER_DF.RData"
+load(file_name)
+
+# identifying CpGs that intersect with our epigenetic marker 
+setwd("/gpfs/data/phs/groups/Projects/GEMS/Kathryn")
+load("best_beta_normalized_2-19-2019.RData")
+mval <- log2(best_beta_normalized/(1 - best_beta_normalized)) 
+SHARED_CPG_LIST <- intersect(EPIGENETIC_MARKER_DF$Name, rownames(best_beta_normalized))
+
+# filtering our datasets to only contain shared CpGs 
+EPIGENETIC_MARKER_DF <- EPIGENETIC_MARKER_DF %>% filter(Name %in% SHARED_CPG_LIST) %>% arrange(Name)
+IMPORTED_MVAL <- mval[rownames(mval) %in% SHARED_CPG_LIST,]
+IMPORTED_MVAL <- IMPORTED_MVAL %>% arrange(rownames(IMPORTED_MVAL))
+identical(EPIGENETIC_MARKER_DF$Name,rownames(IMPORTED_MVAL))
+
+# importing covariates of dataset of interest
+IMPORTED_COV <- fread("covariates/BEST_covariates_1-2-2018.csv",header=T,sep=",") %>% mutate(log2_UrAsgmCr = log2(Urasgmcr)) %>% rename(Sample_Name = ID) %>% select(Sample_Name,log2_UrAsgmCr)
+# obtaining model coefficients
+EPIGENETIC_MARKER_logFC <- EPIGENETIC_MARKER_DF$logFC
+# computing epigenetically predicted arsenic 
+estimated_log2_UrAsgmCr <- c()
+for (current_sample in IMPORTED_COV$Sample_Name) {
+  estimated_log2_UrAsgmCr <- c(estimated_log2_UrAsgmCr,
+                               (sum(as.numeric(IMPORTED_MVAL[,current_sample]) * EPIGENETIC_MARKER_logFC)))
+}
+# print(p_threshold)
+current_thresh_cor <- cor(IMPORTED_COV$log2_UrAsgmCr,estimated_log2_UrAsgmCr)
+
+# plotting scatter plot of epigenetically predicted and measured urinary arsenic levels in the BEST cohort
+BEST_predicted_measured_As <- data.frame(`Measured Urinary Arsenic Levels` = IMPORTED_COV$log2_UrAsgmCr, `Epigenetically Predicted Urinary Arsenic Scores` = estimated_log2_UrAsgmCr)
+colnames(BEST_predicted_measured_As) <- c("Measured Urinary Arsenic Levels", "Epigenetically Predicted Urinary Arsenic Scores")
+summary(lm(BEST_predicted_measured_As, formula = `Measured Urinary Arsenic Levels` ~ `Epigenetically Predicted Urinary Arsenic Scores`))
+
+# plotting out validation plot
+png("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output/EPIGENETIC_MARKER_ARSENIC_EXPOSURE_450k/VALIDATION_CORRELATION_PLOT_BEST.png",units="in",height=5,width=5,res=1200)
+p <- ggplot(BEST_predicted_measured_As, aes(x=`Epigenetically Predicted Urinary Arsenic Scores`,y=`Measured Urinary Arsenic Levels`)) + geom_point() + geom_smooth(method = "lm") + annotate(geom = "text", x = 0.70, y=4.65, label=expression(paste(R^2,": 0.19")),size=5) + annotate(geom = "text", x = 0.70, y=4.05, label=expression(paste("p-value: 1.31E-19")),size=5) + theme_classic() + theme(panel.border = element_rect(colour = "black", fill=NA), axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14)) 
+print(p)
+dev.off()
+
+# print out mean measured and predicted arsenic
+print(paste("Mean Measured As:",mean(BEST_predicted_measured_As$`Measured Urinary Arsenic Levels`)))
+print(paste("Mean Epigenetic As:",mean(BEST_predicted_measured_As$`Epigenetically Predicted Urinary Arsenic Scores`)))
+```
+
+# Validating the epigenetic marker in SHS
+```{bash}
+
+########################################################
+# cd /gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output/EPIGENETIC_MARKER_ARSENIC_EXPOSURE
+
+cd /EPIC/FINAL_DATA
+
+R
+library(data.table)
+library(dplyr)
+
+# loading SHS data
+load("M_RCP.Rda")
+
+# manually grabbed coefficients
+Name <- c('cg04893611','cg02641839','cg13057875','cg03945895','cg23513000','cg03180011','cg21152304','cg06216065','cg10711145','cg10254445','cg03761216','cg07480639','cg04550950','cg15512289','cg01791524','cg11947712','cg09036468','cg24430920','cg06466147','cg13968233','cg09421232','cg05663480','cg17894719','cg26224923','cg26093964','cg11115502','cg22717723','cg00189117','cg14651327','cg03289816','cg14931378','cg04260584','cg12124090','cg07346426','cg21571995','cg14108285','cg19066876','cg06801305','cg11907276','cg09319083','cg20936142','cg01095763','cg04582369','cg00231361','cg14320320','cg05930631','cg08436654','cg25019890','cg11256374','cg10255761','cg18308510','cg10753966','cg10241937','cg02639218','cg22517730','cg24920294','cg24525065','cg19534475','cg01907945','cg27402634','cg18711583','cg16166958','cg23683730','cg03733470','cg22953687','cg21510186','cg05440526','cg01164417','cg01153053','cg17894854','cg04151727','cg22256784','cg10102128','cg25689838','cg15848159','cg07261946','cg21773245','cg04491800','cg06690548','cg24668753','cg11538149','cg05887366','cg26225478','cg17842821','cg03231199','cg27165960','cg07872489','cg26160660','cg13761615','cg07033790','cg03746860','cg27610206','cg11441280','cg19730422','cg13667243','cg06938464','cg10137337','cg16931200','cg13583602','cg09041851','cg18891604','cg18704138','cg06438159','cg15706574','cg16756949','cg06367607','cg05087792','cg07617039','cg04334496','cg02123704','cg26701785','cg09848638','cg11079619','cg12856392','cg11670749','cg25773935','cg05788267','cg03834786','cg11543304','cg16748130','cg13732043','cg10965265','cg23055986','cg14937504','cg24491618','cg06819296','cg07312099','cg00078857','cg16225800','cg04903019','cg14269813','cg04825341','cg09440862','cg06402858','cg11088536','cg22345623','cg14405625','cg18892873','cg10454881','cg10955407','cg13409442','cg06228645','cg20626045','cg03717584','cg26510238','cg01740552','cg15108641','cg23969297','cg05962511','cg14165660','cg09066266','cg05646745','cg04249817','cg15289899','cg21239418','cg16493238','cg17603132','cg22169659','cg03700417','cg11559886','cg25281677','cg08540622','cg07602847','cg17191060','cg08559782','cg22898516','cg04574480','cg12635154','cg00997853','cg20389635','cg12750791','cg00213082','cg19222775','cg22827806','cg03348792','cg10185759','cg18774692','cg02637282','cg26358374','cg27656459','cg27519981','cg07891540','cg08302053','cg02489630','cg13960680','cg21049840','cg08790320','cg16875568','cg26696488','cg01242348','cg19743728','cg02525267','cg25504557','cg18268625','cg03221779','cg19515081','cg00884574','cg05438461','cg17514855','cg13077072','cg27238311','cg26657240','cg05989795','cg13938970','cg14918689','cg27246364','cg27162196','cg05864097','cg01912040','cg10003262','cg26705394','cg21110915','cg06040872','cg26299044','cg22078805','cg03452365','cg00512837','cg22011053','cg09662588','cg07559942','cg18632189','cg20671304','cg02348119','cg01695994','cg07142466','cg17420142','cg16616857','cg09661126','cg02382818','cg07352016','cg12272104','cg09176309','cg09777776','cg00244260','cg01520578','cg00724936','cg06381803','cg22992022','cg26288449','cg00572387','cg10516161','cg15031924','cg24118151','cg25779645','cg09462575','cg09653610','cg26322579','cg10546626','cg18563860','cg14813872','cg26390598','cg13915314','cg21980274','cg09691433','cg07513672')
+logFC<-c(0.0654720699,0.0005325312,0.0565941327,0.005440264,0.0019831106,0.0308006935,0.0113147581,-0.0824228371,0.0292557089,0.091017334,-0.0416063636,0.0063550351,0.0319291443,-0.0785172379,-0.0045143126,-0.0156337026,0.0048117839,0.0518801246,-0.2169179185,0.0156768444,0.1363686599,-0.1450196813,0.0353201223,0.0834326129,0.1536774484,0.0341705892,0.0304089795,0.0487874086,-0.0989439928,0.0092106594,-0.4176492,0.0241484797,-0.0021932865,-0.1311880651,-0.0435978017,0.0023687774,0.0919580438,-0.0030931989,0.0488540093,0.0301909567,0.0725347243,0.0539794528,-0.050742534,0.0261231268,-0.0286967712,0.0222029249,-0.0163767333,0.0652470461,0.0772469286,-0.0702813389,-0.026730379,0.036218606,-0.063888848,-0.0226482188,0.0315260804,-0.0733187896,-0.009525115,0.372922672,0.1032188203,0.0106727275,0.0054398254,0.0611337964,0.0122137502,-0.0194244447,-0.0216740599,-0.0974171312,-0.121199555,0.0476370932,-0.0125255527,0.0096237381,0.1447342398,0.0420247338,0.0001188268,0.0048241554,0.0018213316,0.0432549455,0.0712243072,-0.0883486456,-0.1030845532,-0.1196611499,0.0640986325,0.0315885347,0.0379099588,-0.0682025276,0.0144813451,-0.1896970656,0.0002530813,0.0125042183,-0.0083105524,0.0037537938,0.0187346799,0.0734886856,0.0250060951,-0.1323484367,0.2079615132,0.0003248418,-0.0662737535,-0.2057468118,0.006515583,-0.0184793117,0.0018368955,0.00827114,-0.0500682915,-0.0003966194,0.0522359179,0.0446492469,-0.035651578,-0.0325751823,-0.0311245089,-0.0222056448,-0.0062847904,0.1554810763,-0.0253476593,0.0372904716,-0.0555602798,0.0669168665,-0.0761776379,-0.1857184785,0.0341054328,-0.0060993826,0.0298600963,0.1185072812,0.1768778805,0.0067412729,-0.0408863777,0.0782654745,0.0116483832,0.0931575064,0.0483979399,0.017753155,-0.078875658,0.0210884738,0.0707697839,0.0920708474,-0.0107109575,-0.0607452354,0.145643595,0.0025306405,0.0059176944,0.0403745755,-0.0586967459,0.0435601728,0.0200676095,-0.0919008855,0.0424725956,0.0087327957,0.3293264337,0.0053625518,-0.1294081821,-0.0443220147,-0.0719122418,0.0203616949,0.1082261497,-0.0206778833,0.0247498285,-0.0216410851,0.0431079529,0.0167044479,0.0137304908,-0.0305657599,-0.1478034342,0.0662229648,-0.0446439345,-0.0315120769,0.0177501728,-0.1081924935,0.0035377145,-0.0083095592,-0.1567362401,0.0568248705,0.0082333087,0.0463611291,0.1354296011,0.1452631976,0.0648773119,-0.1273427151,-0.0555897204,-0.0074578204,-0.1973837503,-0.0754847099,-0.0169135183,-0.0010802316,0.127940196,-0.0742426158,0.1263342717,0.0720999729,-0.0084870211,-0.0358295739,-0.0428511785,-0.0488480456,0.0174379361,-0.0938839019,0.0052143422,0.0020393501,0.0794630218,-0.0426028787,-0.0306306084,0.0079014892,0.0612792369,0.021490252,-0.0391755973,0.0009884717,-0.154187497,0.0258048134,-0.0282095852,0.0241974164,0.0925981988,0.0044956879,-0.0711472398,-0.1482304364,0.0311628688,-0.0243761293,-0.0010270946,0.0188815104,-0.0138439349,-0.0957910052,-0.0290406871,0.0279240446,0.1437508004,0.0539607524,-0.0269477973,0.0285240853,-0.0255470009,-0.0912826105,-0.0597252765,-0.2336888443,0.1100902139,0.1149548697,-0.1010388993,-0.0018650587,-0.0165017947,0.3199992363,0.0420088508,-0.0364794356,-0.0455879411,-0.0323657751,-0.0594159086,-0.0745017863,-0.2004552708,-0.1174937261,0.0157571868,0.0411689154,0.0304209825,-0.0934181818,0.0688134298,0.0045979325,0.1746935761,0.1061755862,-0.0516842205,-0.0115680105,0.051642581,-0.0729637576,0.0791927193,0.0094796713,-0.0957021312)
+EPIGENETIC_MARKER_DF <- data.frame(Name,logFC)
+rownames(EPIGENETIC_MARKER_DF) <- EPIGENETIC_MARKER_DF$Name
+mval <- M.combat
+SHARED_CPG_LIST <- intersect(EPIGENETIC_MARKER_DF$Name, rownames(mval))
+EPIGENETIC_MARKER_DF <- EPIGENETIC_MARKER_DF[SHARED_CPG_LIST,]
+IMPORTED_MVAL <- mval[SHARED_CPG_LIST,]
+identical(EPIGENETIC_MARKER_DF$Name,rownames(IMPORTED_MVAL))
+
+# importing covariates of dataset of interest
+raw_pheno <- data.frame(pd.BS)
+IMPORTED_COV <- raw_pheno %>% select(Slide_Array,PID,as.cr.ln,sex,s1age,s1bmi,s1smoke,s1edu,batch,CD8T,CD4T,NK,Bcell,Mono,Neu,center,s1etoh,s1anychd,s2anychd,s3anychd,fatalchd,fatalchf,fatalmi,fatalstk,s1anycvd,s2anycvd,s3anycvd,s1anystk,s2anystk,s3anystk,s1anychf,s2anychf,s3anychf,s1anymi,s2anymi,s3anymi,deadcode,s1gfr,s1htn,s1hba1c,s1bdfat,s1htnhx)
+colnames(IMPORTED_COV)[1] <- c("Sample_Name")
+# IMPORTED_COV$Sample_Name <- paste0("X",IMPORTED_COV$Sample_Name)
+
+# obtaining model coefficients
+EPIGENETIC_MARKER_logFC <- EPIGENETIC_MARKER_DF$logFC
+
+# computing epigenetically predicted arsenic 
+estimated_log2_UrAsgmCr <- c()
+for (current_sample in IMPORTED_COV$Sample_Name) {
+    estimated_log2_UrAsgmCr <- c(estimated_log2_UrAsgmCr,
+    (sum(as.numeric(IMPORTED_MVAL[,current_sample]) * EPIGENETIC_MARKER_logFC)))
+}
+IMPORTED_COV$estimated_log2_UrAsgmCr <- estimated_log2_UrAsgmCr
+save(IMPORTED_COV,file="/home/jli/IMPORTED_COV.RData")
+
+
+######################################################
+Rscript /gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/code/rscripts/SHS_VALIDATING_EPIGENETIC_MARKER.R
+```
+
+# Validation of EWAS results in the Strong Heart Study [PMID: 32603190] (https://pubmed.ncbi.nlm.nih.gov/32603190/)
+```{r}
+# loading our EWAS results
+load("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output/results_final_EWAS_HEALS_combined_mval_specifySV_log2_UrAsgmCr_9SV.RData") 
+
+# loading SHS EWAS results
+SHS_EWAS <- fread("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/download_data/PMID_32603190_TABLES1",header=T) 
+colnames(SHS_EWAS)[1] <- "Name"
+
+combined_HEALS_SHS_EWAS <- inner_join(results_final, 
+  SHS_EWAS,
+  by=c("Name")
+)
+combined_HEALS_SHS_EWAS$Consistency <- (combined_HEALS_SHS_EWAS$logFC / combined_HEALS_SHS_EWAS$`Effect estimate`) > 0
+
+# plotting consistency scatter plot for validated CpGs 
+setwd("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output")
+tiff("scatterplot_HEALS_SHS_validated_CpGs.tiff")
+current_df <- (combined_HEALS_SHS_EWAS %>% filter(P.Value < 0.05/nrow(results_final)))
+p <- ggplot(current_df,aes(x=logFC,y=`Effect estimate`)) + geom_point() + geom_abline(intercept = 0, slope = 1, color="red") + geom_vline(xintercept=0,size=1) + geom_hline(yintercept=0,size=1) + ggtitle("Comparing EWAS effect size estimates between HEALS and the SHS\nfor 19 arsenic-associated CpGs validated in SHS (p<0.05)") + xlab("HEALS EWAS log2[Fold-Change]") + ylab("SHS EWAS log2[Fold-Change]") + theme_classic()
+p
+dev.off()
+cor(current_df$logFC,current_df$`Effect estimate`,method = "spearman")
+binom.test(x=sum(current_df$Consistency), n=nrow(current_df), p=0.5, alternative=c("two.sided"))
+```
+
+# Meta-analysis with the SHS
+```{r}
+# preparing files 
+library(dplyr)
+library(data.table)
+sumstats <- fread("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/data/SHS/sumstats/SHS_lnTotAsCr_EWAS_adjCellAgeSexBMISmokeEduSiteGFR_allProbes.csv",header=T,sep=",")
+sumstats <- sumstats %>% mutate(logFC_SE = abs((CI.R-CI.L)/(2*qnorm(0.975)))) %>% 
+select(V1,logFC,logFC_SE,P.Value)
+colnames(sumstats) <- c("Name","Beta","SE","P")
+sumstats <- sumstats %>% mutate(N = rep(2325,nrow(sumstats)))
+write.table(sumstats,file="/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/data/METAL_SHS.csv",sep=",",quote=F,row.names=F,col.names=T) 
+
+load("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output/results_EWAS_HEALS_combined_mval_specifySV_log2_UrAsgmCr_9SV.RData")
+results <- results %>% mutate(logFC_SE = abs((CI.R-CI.L)/(2*qnorm(0.975)))) %>% mutate(Name=rownames(results)) %>% select(Name,logFC,logFC_SE,P.Value)
+colnames(results) <- c("Name","Beta","SE","P")
+results <- results %>% mutate(N = rep(1186,nrow(results)))
+write.table(results,file="/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/data/METAL_HEALS.csv",sep=",",quote=F,row.names=F,col.names=T) 
+
+############################
+cd /gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output/METAL/
+module load metal
+metal
+SCHEME SAMPLESIZE
+
+# Study 1
+SEPARATOR        COMMA
+MARKERLABEL      Name   
+EFFECTLABEL 	   Beta
+STDERRLABEL      SE
+PVALUELABEL      P
+SAMPLESIZE      N
+PROCESSFILE      /gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/data/METAL_SHS.csv
+
+# Study 2
+SEPARATOR        COMMA
+MARKERLABEL      Name   
+EFFECTLABEL 	   Beta
+STDERRLABEL      SE
+PVALUELABEL      P
+SAMPLESIZE      N
+PROCESSFILE      /gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/data/METAL_HEALS.csv
+
+OUTFILE /gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output/METAL/OUTPUT_SHS_HEALS.tbl
+ANALYZE HETEROGENEITY
+QUIT
+
+metaSUM <- sumstats %>% filter(`P-value`<0.05/nrow(sumstats)) %>% select(MarkerName,`P-value`)
+
+load("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output/results_EWAS_HEALS_combined_mval_specifySV_log2_UrAsgmCr_9SV.RData")
+significant_results <- results %>% filter(P.Value < 0.05) 
+significant_results$MarkerName <- rownames(significant_results) 
+significant_results <- significant_results %>% select(MarkerName,P.Value)
+```
+
+# Epigenetic aging
+```{bash}
+library("data.table")
+library("dplyr")
+library("forestplot")
+library("dnaMethyAge")
+# devtools::install_github("yiluyucheng/dnaMethyAge")
+# https://github.com/yiluyucheng/dnaMethyAge
+
+# loading beta values and covariates
+load("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/data/combined_beta.RData")
+load("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/data/combined_cov.RData")
+
+# checking available clocks in dnaMethyAge
+clock_list <- availableClock()
+clock_list <- clock_list[!(clock_list %in% c(
+  "HorvathS2013","HannumG2013","Cortex_common","YangZ2016","BernabeuE2023c",
+  "epiTOC2","CBL_specific","HorvathS2018","LevineM2018","CBL_common"))]
+
+clock_estimate_list <- vector(length=length(clock_list),mode="list")
+for (i in 1:length(clock_list)) {
+  print(paste(i,"out of",length(clock_list)))
+  clock_name <- clock_list[i]
+  if (clock_name != "PCGrimAge") {
+    info <- combined_cov %>% select(Sample_Name,Age)
+    colnames(info) <- c("Sample","Age")
+    
+  } else {
+    info <- combined_cov %>% select(Sample_Name,Age,Sex)
+    colnames(info) <- c("Sample","Age","Sex")
+  }
+  clock_estimate <- PCGrimAge <- methyAge(betas=combined_beta, clock=clock_name, age_info=info) %>% select(Sample,Age_Acceleration)
+  colnames(clock_estimate)[2] <- paste0("ageAcc.",clock_name)
+  clock_estimate_list[[i]] <- clock_estimate
+}
+
+# combining all the aging estimates 
+combined_aging <- Reduce(full_join,clock_estimate_list)
+combined_aging <- data.frame(combined_aging)
+colnames(combined_aging)[1] <- "Sample_Name"
+
+# merging the acceleration estimates with covariates
+combined_cov_CT_clock <- inner_join(combined_aging,combined_cov,by=c("Sample_Name"))
+
+# age acceleration analysis
+effect_size <- c()
+lower <- c()
+upper <- c()
+for (clock_name in clock_list) {
+  clock_acc_index <- (which(grepl(paste0("ageAcc.",clock_name),colnames(combined_cov_CT_clock))))
+  formula_clock <- combined_cov_CT_clock[,clock_acc_index] ~ combined_cov_CT_clock$log2_UrAsgmCr + as.factor(combined_cov_CT_clock$Sex) + as.factor(combined_cov_CT_clock$bmi_cat) + as.factor(combined_cov_CT_clock$cigsmoke) + combined_cov_CT_clock$B + combined_cov_CT_clock$NK + combined_cov_CT_clock$CD4T + combined_cov_CT_clock$CD8T + combined_cov_CT_clock$Mono
+  print(paste(clock_name, summary(lm(formula_clock))$coefficients[2,1] , summary(lm(formula_clock))$coefficients[2,4]))
+  
+  effect_size <- c(effect_size, summary(lm(formula_clock))$coefficients[2,1])
+  lower <- c(lower, summary(lm(formula_clock))$coefficients[2,1] + qnorm(0.025)*summary(lm(formula_clock))$coefficients[2,2])
+  upper <- c(upper, summary(lm(formula_clock))$coefficients[2,1] + qnorm(0.975)*summary(lm(formula_clock))$coefficients[2,2])
+}
+
+# tidying up columns
+clock_name_list_neat <- c(
+  "Zhang et al. 2019",
+  "Cortical clock",
+  "Zhang et al. 2017",
+  "DNAmTL",
+  "DunedinPACE",
+  "PedBE",
+  "GrimAge",
+  "Horvath Multi-tissue Clock",
+  "Hannum Clock",
+  "Horvath Skin & Blood Clock",
+  "PhenoAge",
+  "Lu Pan-Mammalian Clock #1",
+  "Lu Pan-Mammalian Clock #2",
+  "Lu Pan-Mammalian Clock #3"
+)
+
+mean <- effect_size
+base_data <- data.frame(mean, clock_name_list_neat, effect_size, lower, upper)
+base_data$effect_size <- format(round(base_data$effect_size, 4), nsmall = 4)
+
+# plotting forest plot 
+png("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output/epigenetic_aging_forestplot.png",units="in",height=5,width=7,res=1200)
+base_data |>
+  forestplot(labeltext = c(clock_name_list_neat, effect_size)) |>
+  fp_set_style(box = "royalblue",
+               line = "darkblue",
+               summary = "royalblue") |> 
+  fp_add_header(clock_name_list_neat = c("", "Clock Name"),
+                effect_size = c("", "Effect Size")) |>
+  fp_set_zebra_style("#EFEFEF")
+dev.off()
+```
+
+# Creating table of FDR-significant CpGs and examine clustering of CpGs
+```{r}
+library(dplyr)
+library(data.table)
+library(RANN)
+library(tidyr)
+
+# load arsenic EWAS results
+load("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output/results_final_EWAS_HEALS_combined_mval_specifySV_log2_UrAsgmCr_9SV.RData")
+
+# obtaining bonferroni adjusted p-values
+results_final <- results_final %>% mutate(bonferroni=p.adjust(P.Value,method="bonferroni"))
+
+# filtering cpgs FDR < 0.05
+results_final <- results_final %>% filter(adj.P.Val < 0.05)
+results_final <- results_final %>% mutate(CHR=as.numeric(CHR)) %>% mutate(modified_MAPINFO = CHR*(1e14) + MAPINFO)
+
+# utilizing a window size of 5kb to identify tolerance sets/clusters
+x <- c(results_final$modified_MAPINFO)
+tol=5000
+nn <- nn2(x,x,k=length(x),searchtype="radius",radius=tol)
+m <- unique(apply(nn$nn.idx,1,sort), MARGIN=2)
+tolerance_set <- sapply(seq_len(ncol(m)), function(i) m[which(m[,i] > 0),i])
+
+# recording cluster ids
+results_final$cluster <- NA
+for (i in 1:length(tolerance_set)) {
+  for (j in 1:length(tolerance_set[[i]])) {
+    cpg_index <- tolerance_set[[i]][j]
+    results_final$cluster[cpg_index] <- i
+  }
+}
+
+# assigning a cluster count to each cluster     
+cluster_count <- results_final %>% group_by(cluster) %>% summarise(n_cluster=n()) %>% mutate(cluster_id = cluster)
+results_final <- inner_join(results_final,cluster_count,by=c("cluster"))
+
+# annotating results
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island==""]<-"Non-CpG Island"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="Island"]<-"Island"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="N_Shelf"]<-"Shelf"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="S_Shelf"]<-"Shelf"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="N_Shore"]<-"Shore"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="S_Shore"]<-"Shore"
+
+# if UCSC annotations are blank, use the gencode annotations
+TABLE_S2 <- results_final %>% mutate(UCSC_RefGene_Name = ifelse(UCSC_RefGene_Name=="",GencodeCompV12_NAME,UCSC_RefGene_Name)) %>% mutate(UCSC_RefGene_Group = ifelse(UCSC_RefGene_Group=="",GencodeCompV12_Group,UCSC_RefGene_Group)) 
+
+TABLE_S2 <- TABLE_S2 %>% arrange(P.Value) %>% dplyr::select(Name, CHR, MAPINFO, Relation_to_UCSC_CpG_Island, UCSC_RefGene_Name, UCSC_RefGene_Group, logFC, CI.L, CI.R, P.Value, adj.P.Val,bonferroni,cluster_id,n_cluster) %>% separate(UCSC_RefGene_Name, sep=";", into = c("Nearest Gene")) %>% separate(UCSC_RefGene_Group, sep=";", into = c("Feature")) %>% mutate(Feature = ifelse(Feature=="","Intergenic",Feature)) # %>% mutate(`Nearest Gene` = ifelse(`Nearest Gene`=="","-",`Nearest Gene`))
+colnames(TABLE_S2) <- c("Name","Chromosome", "Position","CpG Location", "Nearest Gene", "Gene Feature", "log2[Fold-Change]","95% CI of log2[Fold-Change] Lower Bound","95% CI of log2[Fold-Change] Upper Bound", "p-value", "FDR-adjusted p-value","Bonferroni-adjusted p-value","Cluster ID","Number of CpGs in Cluster")
+TABLE_S2 <- TABLE_S2 %>% mutate(`Nearest Gene`=ifelse(`Nearest Gene`=="PNMAL2","PNMA8B",`Nearest Gene`))
+
+# TABLE_S2 %>% arrange(desc(`Number of CpGs in Cluster`),Chromosome,Position) %>% head(20)
+
+# Modifying the gene features names
+TABLE_S2 <- TABLE_S2 %>% mutate(`Gene Feature`=ifelse(`Gene Feature`=="1stExon","First Exon",ifelse(`Gene Feature`=="3'UTR","3' UTR",ifelse(`Gene Feature`=="5'UTR","5' UTR",ifelse(`Gene Feature`=="ExonBnd","Exon Boundary",ifelse(`Gene Feature`=="","",`Gene Feature`)))))) 
+
+# outputting table
+write.table(TABLE_S2,file="/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output/TABLE_S2.tsv",quote=F,row.names=F,col.names=T,sep="\t")
+
+# identifying number of isolated hits
+nrow(TABLE_S2 %>% filter(`Number of CpGs in Cluster`==1))
+# identifying number of clusters
+length(unique((TABLE_S2 %>% filter(`Number of CpGs in Cluster`>1))$`Cluster ID`))
+```
+
+# Importing previously identified As-associated CpGs
+```{r}
+library(dplyr)
+library(data.table)
+library(readxl)
+
+# load manifest file
+manifest <- fread("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/data/annotation/manifest/manifest_4.csv",sep=",")
+manifest <- manifest %>% filter(CHR %in% c(1:22)) %>% mutate(CHR=as.numeric(CHR)) %>% mutate(modified_MAPINFO = CHR*(1e14) + MAPINFO)
+# assigning each SNP to a window of 5 Mb
+manifest <- manifest %>% mutate(cluster = floor(modified_MAPINFO/50000)) 
+
+# load this study's CpGs
+TABLE_S2 <- fread("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output/TABLE_S2.tsv")
+cluster_this_study <- unique((manifest %>% filter(Name %in% TABLE_S2$Name))$cluster)
+
+# load previous CpGs 
+PREVIOUS_CPG <- data.frame(read_excel("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/data/PREVIOUS_STUDIES/PREVIOUS_STUDIES_URINE_AS_BLOOD_DNAM.xlsx", sheet = "CpGs"))
+Intersected_CpG<-intersect(TABLE_S2$Name,PREVIOUS_CPG$Name)
+# PREVIOUS_CPG %>% filter(Name %in% Intersected_CpG)
+cluster_previous_study <- unique((manifest %>% filter(Name %in% PREVIOUS_CPG$Name))$cluster)
+
+# identifying number of unique and overlapping clusters
+length(cluster_this_study)
+length(cluster_previous_study)
+length(intersect(cluster_this_study,cluster_previous_study))
+length(setdiff(cluster_this_study,cluster_previous_study))
+length(setdiff(cluster_previous_study,cluster_this_study))
+
+# identifying cpgs in previous studies with new nearby hits
+previous_genes <- (TABLE_S2 %>% filter(Name %in% Intersected_CpG,`Number of CpGs in Cluster`>1))$`Nearest Gene`
+
+TABLE_S2 %>% filter(`Nearest Gene` %in% previous_genes)
+```
+
+# EWAS catalog: Examining the identification of As-associated CpGs in the EWAS catalog
+```{r}
+library(data.table)
+library(dplyr)
+
+# importing ewas catalog
+setwd("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/download_data")
+ewas_catalog <- fread("ewascatalog-results.txt.gz")
+colnames(ewas_catalog)[1] <- "Name"
+
+# importing As-associated CpGs
+TABLE_S2 <- fread("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output/TABLE_S2.tsv")
+
+# removing conditions not explicitly related to human health and diseases
+ewas_catalog <- ewas_catalog %>% filter(!grepl("somascan_protein_measurement",StudyID)) %>% filter(!grepl("re-analysis_of_geo_data__geo_accession",StudyID))
+
+# filtering for As-associated CpGs 
+ewas_catalog <- ewas_catalog %>% filter(Name %in% TABLE_S2$Name)
+dim(ewas_catalog)
+length(unique(ewas_catalog$Name))
+sort(table(ewas_catalog$StudyID))
+
+head(TABLE_S2 %>% arrange(desc(`Number of CpGs in Cluster`)),10)
+
+# querying specific CpGs
+ewas_catalog %>% filter(Name=="cg19534475")
+ewas_catalog %>% filter(Name=="cg14937504")
+PNMA8B_CPG <- c(
+  "cg04689048", "cg04255201", "cg11410682", "cg03969996", "cg24718465", "cg16617301", "cg18709349", "cg25806524"
+)
+CCDC105_CPG <- c(
+  "cg05923226", "cg02489552", "cg18932116", "cg09470638"
+)
+ewas_catalog %>% filter(Name%in%PNMA8B_CPG)
+ewas_catalog %>% filter(Name%in%CCDC105_CPG)
+
+# cancer traits for all CpGs
+unique(ewas_catalog$StudyID[grepl("arcinoma",ewas_catalog$StudyID)])
+unique(ewas_catalog$StudyID[grepl("cancer",ewas_catalog$StudyID)])
+unique(ewas_catalog$StudyID[grepl("Cancer",ewas_catalog$StudyID)])
+
+# write out ewas catalog intersection table
+write.table(ewas_catalog,file="../output/TABLE_ewascatalog.tsv",quote=F,row.names=F,col.names=T,sep="\t")
+
+####################################
+# evaluating enrichment of As-associated CpGs
+# importing ewas catalog
+setwd("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/download_data")
+ewas_catalog <- fread("ewascatalog-results.txt.gz")
+colnames(ewas_catalog)[1] <- "Name"
+
+# importing As-associated CpGs
+TABLE_S2 <- fread("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output/TABLE_S2.tsv")
+
+# removing conditions not explicitly related to human health and diseases
+ewas_catalog <- ewas_catalog %>% filter(!grepl("somascan_protein_measurement",StudyID)) %>% filter(!grepl("re-analysis_of_geo_data__geo_accession",StudyID))
+
+# filtering for As-associated CpGs 
+ewas_catalog_As <- ewas_catalog %>% filter(Name %in% TABLE_S2$Name)
+
+# import manifest file
+manifest<-read.csv("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/data/annotation/manifest/manifest_4.csv", header=T,sep=",")
+
+load("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output/results_final_EWAS_HEALS_combined_mval_specifySV_log2_UrAsgmCr_9SV.RData")
+
+# conducting enrichment test
+ewas_catalog_manifest <- ewas_catalog %>% filter(Name %in% results_final$Name)
+
+a <- length(unique(ewas_catalog_As$Name))
+b <- nrow(TABLE_S2)
+b <- b-a
+c <- length(unique(ewas_catalog_manifest$Name))
+d <- nrow(results_final)
+d <- d-c
+a/b
+c/d
+
+dat <- data.frame(c(a,c),c(b,d))
+test <- fisher.test(dat)
+test$p.value
+``` 
+
+# Examining enrichment of DNase I hypersensitivity sites and enhancers based on illumina annotations
+```{r}
+library(data.table)
+library(dplyr)
+
+load("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output/results_final_EWAS_HEALS_combined_mval_specifySV_log2_UrAsgmCr_9SV.RData")
+
+results_final <- results_final %>% mutate(DNase_Hypersensitivity_Evidence_Count=ifelse(is.na(DNase_Hypersensitivity_Evidence_Count),0,1)) %>% mutate(Enhancer_Evidence_Count=ifelse(Phantom5_Enhancers!="",1,0))
+
+# illumina dnaseI
+nosig_dnase <- as.numeric(table((results_final%>%filter(adj.P.Val > 0.05))$DNase_Hypersensitivity_Evidence_Count))
+sig_dnase <- as.numeric(table((results_final%>%filter(adj.P.Val < 0.05))$DNase_Hypersensitivity_Evidence_Count))
+x<-fisher.test(data.frame(nosig_dnase,sig_dnase))
+x$p.value
+
+# enhancers
+nosig_enhancer <- as.numeric(table((results_final%>%filter(adj.P.Val > 0.05))$Enhancer_Evidence_Count))
+sig_enhancer <- as.numeric(table((results_final%>%filter(adj.P.Val < 0.05))$Enhancer_Evidence_Count))
+x<-fisher.test(data.frame(nosig_enhancer,sig_enhancer))
+x$p.value
+
+sig_results_final <- results_final%>%filter(adj.P.Val < 0.05)
+table(
+  (sig_results_final%>%filter(Enhancer_Evidence_Count==1))$logFC>0
+)
+table(
+  (sig_results_final%>%filter(Enhancer_Evidence_Count==0))$logFC>0
+)
+```
+
+# Examining CpGs in regions with multiple hits vs those with only 1 hit
+```{r}
+library(data.table)
+library(dplyr)
+
+# importing all annotations
+load("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output/results_final_EWAS_HEALS_combined_mval_specifySV_log2_UrAsgmCr_9SV.RData")
+results_final <- results_final %>% mutate(Enhancer_Status=ifelse(Phantom5_Enhancers=="",0,1)) %>% mutate(DNaseHyper_status = ifelse(is.na(DNase_Hypersensitivity_Evidence_Count),0,1))
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island==""]<-"Open Sea"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="Island"]<-"Island"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="N_Shelf"]<-"Shelf"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="S_Shelf"]<-"Shelf"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="N_Shore"]<-"Shore"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="S_Shore"]<-"Shore"
+results_final <- results_final %>% select(Name,Enhancer_Status,DNaseHyper_status,Relation_to_UCSC_CpG_Island)
+
+# importing As-associated CpGs
+TABLE_S2 <- fread("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output/TABLE_S2.tsv")
+TABLE_S2 <- TABLE_S2 %>% mutate(MultiCpG=ifelse(`Number of CpGs in Cluster`>1,1,0))
+
+# joining dfs
+joined_df <- inner_join(TABLE_S2,results_final,by=c("Name"))
+fisher.test(table(joined_df$MultiCpG,joined_df$DNaseHyper_status))$p.value
+fisher.test(table(joined_df$MultiCpG,joined_df$Enhancer_Status))$p.value
+
+chisq.test(table(joined_df$MultiCpG,joined_df$Relation_to_UCSC_CpG_Island))$p.value
+
+relation_df <- data.frame(table(joined_df$MultiCpG,joined_df$Relation_to_UCSC_CpG_Island))
+relation_df$Freq / c(rep(c(1003,174),4))
+```
+
+
+# Examining eQTMs 
+```{r}
+library(dplyr)
+library(data.table)
+
+setwd("/gpfs/data/phs/groups/Projects/GTEx/eQTMs_Oliva_et_al_2023")
+
+eQTM <- fread("WholeBlood.cor.stats.complete.txt")
+eQTM %>% filter(cpg=="cg25806524")
+eQTM %>% filter(cpg=="cg14937504")
+
+
+
+
+eQTM %>% filter(cpg %in% c(
+  "cg25806524",
+  "cg03969996",
+  "cg16617301",
+  "cg24718465",
+  "cg11410682",
+  "cg18709349",
+  "cg04689048",
+  "cg04255201"
+  ))
+
+
+mQTL <- fread("/gpfs/data/pierce-lab/james.li/imQTL/previous_mQTL/wb.regular.perm.fdr.txt")
+mQTL %>% filter(cpg_id %in% c(
+  "cg25806524",
+  "cg03969996",
+  "cg16617301",
+  "cg24718465",
+  "cg11410682",
+  "cg18709349",
+  "cg04689048",
+  "cg04255201"
+  ))
+mQTL %>% filter(cpg_id=="cg14937504")
+
+
+
+mQTL <- fread("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/download_data/meQTL_full.txt.gz")
+mQTL %>% filter(CpG=="cg19534475")
+mQTL %>% filter(CpG=="cg25806524")
+mQTL %>% filter(CpG=="cg14937504")
+
+
+
+mQTL %>% filter(CpG %in% c(
+  "cg25806524",
+  "cg03969996",
+  "cg16617301",
+  "cg24718465",
+  "cg11410682",
+  "cg18709349",
+  "cg04689048",
+  "cg04255201"
+  ))
+
+```
+
+# Comparing logFC for significant CpGs identified in both the past and current EWASs (still not finalized section)
+```{r}
+library(dplyr)
+library(data.table)
+library(ggplot2)
+
+# loading EWAS results using mval values and then converting logFC into the beta value scale
+setwd("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output")
+load("results_final_EWAS_HEALS_combined_mval_specifySV_log2_UrAsgmCr_9SV.RData")
+
+# importing the 34 CpGs identified in the prior EWAS
+setwd("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/download_data")
+prior_EWAS_34_CpG<-fread("Prior_EWAS_34_CpG.txt",header=T)
+
+# determining which CpGs were significant in both the current and previous studies
+replicated_CpG_list<-(inner_join(prior_EWAS_34_CpG,results_final%>%filter(adj.P.Val<0.05),by=c("Name")))$Name
+
+# examining effect sizes of replicated CpGs just using both 2017 + 20172021 data
+load("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output/results_final_EWAS_HEALS_combined_beta_specifySV_log2_UrAsgmCr_9SV.RData")
+results_final <- results_final %>% filter(Name %in% replicated_CpG_list)
+vecCURRENT<-(results_final %>% arrange(Name))$logFC
+vecPREVIOUS<- (prior_EWAS_34_CpG %>% filter(Name %in% replicated_CpG_list) %>% arrange(Name))$beta_svab
+replicated_20172021 <- data.frame(vecCURRENT,vecPREVIOUS)
+
+# plotting the logFC effect sizes for current and prior EWAS both 2017 + 20172021 data
+setwd("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output")
+png("scatterplot_past_and_current_EWAS_logFC_20172021.png",units="in",height=6,width=6,res=1200)
+p <- ggplot(replicated_20172021,aes(x=vecPREVIOUS,y=vecCURRENT)) + geom_point() + geom_smooth(method = "lm") + geom_vline(xintercept=0,size=1) + geom_hline(yintercept=0,size=1) + xlab("Prior EWAS effect sizes") + ylab("Current EWAS effect sizes") + theme_classic() + theme(panel.border = element_rect(colour = "black", fill=NA),axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14)) + annotate(geom = "text", x = 0.005, y=-.01, label=expression(paste(R^2,":",0.95)),size=5) + annotate(geom = "text", x = 0.005, y=-0.0115, label=expression(paste("p-value: 5.16E-13")),size=5) 
+p
+dev.off()
+
+# outputting the correlation between effect size estimates
+summary(lm(data=replicated_20172021,vecCURRENT~vecPREVIOUS))
+cor(vecCURRENT,vecPREVIOUS)
+```
+
+
+# Outputting information for Table 1
+```{r}
+library(dplyr)
+library(data.table)
+library(tidyverse)
+setwd("/Volumes/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/data")
+load("combined_cov.RData")
+combined_cov$year[grepl("2021",combined_cov$Batch_Plate)] <- "Year_2021"
+combined_cov$year[grepl("2017",combined_cov$Batch_Plate)] <- "Year_2017"
+
+library(table1) 
+
+combined_cov2 <- combined_cov %>% replace(is.na(.), "missing")
+combined_cov2$WArsenic <- 2^combined_cov$log2_WArsenic
+combined_cov2$UrAsgmCr <- 2^combined_cov$log2_UrAsgmCr
+
+
+# Factor the basic variables that
+# we're interested in
+table1(~ UrAsgmCr + WArsenic + factor(Sex) + Age + factor(cigsmoke) + factor(bmi_cat) + factor(anyskinlesion) | year, data=combined_cov2)
+
+nrow(combined_cov %>% filter(log2_WArsenic > log2(10)))/nrow(combined_cov)
+nrow(combined_cov %>% filter(log2_WArsenic > log2(50)))/nrow(combined_cov)
+
+```
+
+# Supplementary Tables
+```{r}
+#################################
+#################################
+#################################
+library(tidyverse)
+library(dplyr)
+library(data.table)
+
+# log2UrAsgmCr EWAS results
+setwd("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output")
+load("results_final_EWAS_HEALS_combined_mval_specifySV_log2_UrAsgmCr_9SV.RData")
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island==""]<-"Non-CpG Island"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="Island"]<-"Island"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="N_Shelf"]<-"Shelf"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="S_Shelf"]<-"Shelf"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="N_Shore"]<-"Shore"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="S_Shore"]<-"Shore"
+write.table(results_final,file="Supplementary Data File 1.tsv",quote=F,row.names=F,sep="\t")
+# log2WArsenic EWAS results 
+setwd("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output")
+load("results_final_EWAS_HEALS_combined_mval_specifySV_log2_WArsenic_9SV.RData")
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island==""]<-"Non-CpG Island"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="Island"]<-"Island"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="N_Shelf"]<-"Shelf"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="S_Shelf"]<-"Shelf"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="N_Shore"]<-"Shore"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="S_Shore"]<-"Shore"
+write.table(results_final,file="Supplementary Data File 2.tsv",quote=F,row.names=F,sep="\t")
+# reference-based log2UrAsgmCr EWAS results
+load("results_final_EWAS_HEALS_combined_mval_celltype_noSV_log2_UrAsgmCr.RData")
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island==""]<-"Non-CpG Island"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="Island"]<-"Island"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="N_Shelf"]<-"Shelf"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="S_Shelf"]<-"Shelf"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="N_Shore"]<-"Shore"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="S_Shore"]<-"Shore"
+write.table(results_final,file="Supplementary Data File 3.tsv",quote=F,row.names=F,sep="\t")
+
+#################################
+#################################
+#################################
+# Top hits 
+library(GenomicRanges)
+setwd("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output")
+load("results_final_EWAS_HEALS_combined_mval_specifySV_log2_UrAsgmCr_9SV.RData")
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island==""]<-"Non-CpG Island"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="Island"]<-"Island"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="N_Shelf"]<-"Shelf"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="S_Shelf"]<-"Shelf"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="N_Shore"]<-"Shore"
+results_final$Relation_to_UCSC_CpG_Island[results_final$Relation_to_UCSC_CpG_Island=="S_Shore"]<-"Shore"
+
+tmp_TABLE2 <- results_final %>% filter(P.Value < 0.05 / nrow(results_final)) %>% arrange(P.Value) %>% dplyr::select(Name, CHR, MAPINFO, Relation_to_UCSC_CpG_Island, UCSC_RefGene_Name, UCSC_RefGene_Group, logFC, P.Value, adj.P.Val) %>% separate(UCSC_RefGene_Name, sep=";", into = c("Nearest Gene")) %>% separate(UCSC_RefGene_Group, sep=";", into = c("Feature"))
+colnames(tmp_TABLE2) <- c("Name","Chromosome", "Position","CpG Location", "Nearest Gene", "Gene Feature", "log2[Fold-Change]", "p-value", "FDR-adjusted p-value")
+
+# annotating nearby genes with bumphunter
+library(bumphunter)
+library("TxDb.Hsapiens.UCSC.hg19.knownGene")
+
+gr=GRanges(seqnames=paste0(rep("chr",nrow(tmp_TABLE2)),tmp_TABLE2$Chromosome),
+           ranges=IRanges(start=tmp_TABLE2$Position,end=tmp_TABLE2$Position)
+)
+
+txdb <- TxDb.Hsapiens.UCSC.hg19.knownGene::TxDb.Hsapiens.UCSC.hg19.knownGene
+subject <- annotateTranscripts(txdb, annotationPackage = NULL, by = c("tx","gene"), codingOnly=FALSE, verbose = TRUE, requireAnnotation = FALSE, mappingInfo = NULL, simplifyGeneID = FALSE)
+nearest_gene_annotations <- data.table(matchGenes(gr,subject, type = c("any"))) %>% dplyr::select(name,region,distance)
+nearest_gene_annotations$region <- as.character(nearest_gene_annotations$region)
+colnames(nearest_gene_annotations)[1] <- "geneName"
+
+TABLE2 <- cbind(tmp_TABLE2,nearest_gene_annotations)
+TABLE2$`Nearest Gene`[TABLE2$`Nearest Gene`==""] <- TABLE2$geneName[TABLE2$`Nearest Gene`==""]
+TABLE2$`Gene Feature`[TABLE2$`Gene Feature`==""] <- TABLE2$region[TABLE2$`Gene Feature`==""]
+TABLE2$`Gene Feature`[grepl("TSS",TABLE2$`Gene Feature`)] <- TABLE2$region[grepl("TSS",TABLE2$`Gene Feature`)]
+
+TABLE2 <- TABLE2 %>% dplyr::mutate(`Gene Feature`=ifelse(`Gene Feature`=="inside","Body",`Gene Feature`)) %>% dplyr::mutate(`Gene Feature`=ifelse(`Gene Feature`=="promoter","Promoter",`Gene Feature`)) %>% dplyr::mutate(`Gene Feature`=ifelse(`Gene Feature`=="upstream","Upstream",`Gene Feature`)) %>% dplyr::mutate(`Gene Feature`=ifelse(`Gene Feature`=="downstream","Downstream",`Gene Feature`)) %>% dplyr::mutate(`Gene Feature`=ifelse(`Gene Feature`=="1stExon","Body",`Gene Feature`)) %>% dplyr::select(-geneName,-region,-distance) # %>% dplyr::select(`Nearest Gene`,`Gene Feature`,geneName,region,distance)
+
+# writing out the table of bonferroni significant CpGs
+write.table(TABLE2,"TABLE2.tsv",quote=F,row.names=F,sep="\t")
+
+#################################
+#################################
+#################################
+# identifying CpGs in genes with multiple hits
+genes_with_multiple_cpgs <- (data.table(sort(table(TABLE2$`Nearest Gene`))) %>% filter(N>1))$V1
+print(data.table(sort(table(TABLE2$`Nearest Gene`))) %>% filter(N>1))
+
+TABLE2 %>% filter(`Nearest Gene` %in% genes_with_multiple_cpgs)
+
+#################################
+#################################
+#################################
+# identifying how many genes were shared between previous and current EWAS
+library(dplyr)
+library(data.table)
+library(ggplot2)
+
+# loading EWAS results using mval values and then converting logFC into the beta value scale
+setwd("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/output")
+load("results_final_EWAS_HEALS_combined_mval_specifySV_log2_UrAsgmCr_9SV.RData")
+
+# importing the 34 CpGs identified in the prior EWAS
+setwd("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/download_data")
+prior_EWAS_34_CpG<-fread("Prior_EWAS_34_CpG.txt",header=T)
+
+# determining which CpGs were significant in both the current and previous studies
+replicated_CpG_list<-(inner_join(prior_EWAS_34_CpG,results_final%>%filter(adj.P.Val<0.05),by=c("Name")))$Name
+
+# identifying the genes
+TABLE2 %>% filter(`Name` %in% replicated_CpG_list)
+
+#################################
+#################################
+#################################
+# identifying how many bonferroni significant CpGs were also discovered in the WArsenic and reference-based EWASs at an FDR of 0.05
+
+# # loading UrAsgmCr EWAS results
+load("results_final_EWAS_HEALS_combined_mval_specifySV_log2_UrAsgmCr_9SV.RData")
+UrAsgmCr_CpGs <- (results_final %>% filter(P.Value < 0.05 / nrow(results_final)))$Name
+
+# # loading WArsenic EWAS results
+load("results_final_EWAS_HEALS_combined_mval_specifySV_log2_WArsenic_9SV.RData")
+WArsenic_CpGs <- (results_final %>% filter(adj.P.Val < 0.05))$Name
+
+# # loading reference-based UrAsgmCr EWAS results 
+load("results_final_EWAS_HEALS_combined_mval_celltype_noSV_log2_UrAsgmCr.RData")
+Reference_Based_CpGs <- (results_final %>% filter(adj.P.Val < 0.05))$Name
+
+# outputting number of CpGs that overlap 
+print(length(unique(intersect(UrAsgmCr_CpGs,WArsenic_CpGs))))
+print(length(unique(intersect(UrAsgmCr_CpGs,Reference_Based_CpGs))))
+```
+
+# Creating characteristics tables for SHS and BEST
+```{r}
+library(data.table)
+library(dplyr)
+
+load("/gpfs/data/phs/groups/Projects/GEMS/james.li/EWAS/manuscript/download_data/SHS/IMPORTED_COV.RData")
+summary(shs.cox$s1age)
+summary(shs.cox$as.cr)
+table(shs.cox$sex.M)
+summary(shs.cox$s1bmi)
+
+#colnames(IMPORTED_COV)[grepl("smk",colnames(IMPORTED_COV))]
+
+BEST <- fread("/gpfs/data/phs/groups/Projects/GEMS/Kathryn/covariates/BEST_covariates_1-2-2018.csv",sep=",")
+summary(BEST$Age)
+summary(BEST$Urasgmcr)
+table(BEST$Gender)
+summary(BEST$bmi)
+```
